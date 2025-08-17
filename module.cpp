@@ -5,6 +5,7 @@
 #include <torch/extension.h>
 
 #include <iostream>
+#include <limits>
 #include <vector>
 
 // Uncomment for ISPC
@@ -361,14 +362,15 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 
     // -------- YOUR CODE HERE  -------- //
     float zero = 0.0f;
-    for (int i = 0; i < N; i++) {
-        l[i] = zero;
-    }
 
     // loop over Batch Size
     for (int b = 0; b < B; b++) {
         // loop over Heads
         for (int h = 0; h < H; h++) {
+            // Initialize row statistics for this batch/head
+            for (int i = 0; i < N; i++) {
+                l[i] = zero;
+            }
             for (int block_i = 0; block_i < N; block_i += Br) {
                 // Load Qi
                 int local_i_end = std::min(Br, std::max(0, N - block_i));
@@ -380,8 +382,11 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                         twoDimWrite(Qi, local_i, k, d, q_val);
                     }
 
-                    li[local_i] = l[block_i + local_i];
+                    li[local_i] = l[global_i];
+                }
 
+                // Initialize Oi for this row block (start fresh)
+                for (int local_i = 0; local_i < local_i_end; local_i++) {
                     for (int k = 0; k < d; k++) {
                         twoDimWrite(Oi, local_i, k, d, zero);
                     }
@@ -402,46 +407,53 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                         }
                     }
 
-                    // Compute Sij
+                    // Compute Sij = Qi * Kj^T
                     for (int local_i = 0; local_i < local_i_end; local_i++) {
-                        lij[local_i] = 0.0f;
                         for (int local_j = 0; local_j < local_j_end; local_j++) {
                             float acc = 0.0f;
                             for (int k = 0; k < d; k++) {
                                 float query = twoDimRead(Qi, local_i, k, d);
                                 float key = twoDimRead(Kj, local_j, k, d);
-
                                 acc += query * key;
                             }
                             twoDimWrite(Sij, local_i, local_j, Bc, acc);
-                            lij[local_i] += exp(acc);
+                        }
+                    }
+
+                    // Compute denominator for this block
+                    for (int local_i = 0; local_i < local_i_end; local_i++) {
+                        lij[local_i] = 0.0f;
+                        for (int local_j = 0; local_j < local_j_end; local_j++) {
+                            float s = twoDimRead(Sij, local_i, local_j, Bc);
+                            lij[local_i] += exp(s);
                         }
                         lnew[local_i] = li[local_i] + lij[local_i];
                     }
 
-                    // Compute Pij = Softmax(Sij) and PV
+                    // Update output: O_new = (l_old/l_new) * O_old + (1/l_new) * exp(S) * V
                     for (int local_i = 0; local_i < local_i_end; local_i++) {
                         for (int k = 0; k < d; k++) {
-                            float acc = 0.0f;
+                            // Compute contribution from this block
+                            float block_contrib = 0.0f;
                             for (int local_j = 0; local_j < local_j_end; local_j++) {
                                 float s = twoDimRead(Sij, local_i, local_j, Bc);
-                                float p = exp(s) / lnew[local_i];
                                 float v = twoDimRead(Vj, local_j, k, d);
-                                acc += p * v;
+                                block_contrib += exp(s) * v;
                             }
 
+                            // Get current output and update
                             float current_o = twoDimRead(Oi, local_i, k, d);
-                            float weighted_contribution = (li[local_i] / lnew[local_i]) * current_o + acc;
-                            twoDimWrite(Oi, local_i, k, d, weighted_contribution);
+                            float updated_o = (li[local_i] * current_o + block_contrib) / lnew[local_i];
+                            twoDimWrite(Oi, local_i, k, d, updated_o);
                         }
-                        li[local_i] = lnew[local_i];
+                        li[local_i] = lnew[local_i];  // Update denominator for next iteration
                     }
                 }
 
-                // Write to O
+                // Write Oi back to O and update global statistics
                 for (int local_i = 0; local_i < local_i_end; local_i++) {
                     int global_i = block_i + local_i;
-                    l[block_i + local_i] = li[local_i];
+                    l[global_i] = li[local_i];  // Update global denominator
                     for (int k = 0; k < d; k++) {
                         float val = twoDimRead(Oi, local_i, k, d);
                         fourDimWrite(O, b, h, global_i, k, H, N, d, val);
