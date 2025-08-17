@@ -360,6 +360,96 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     std::vector<float> lnew = formatTensor(LnewTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    float zero = 0.0f;
+    for (int i = 0; i < N; i++) {
+        l[i] = zero;
+    }
+
+    // loop over Batch Size
+    for (int b = 0; b < B; b++) {
+        // loop over Heads
+        for (int h = 0; h < H; h++) {
+            for (int block_i = 0; block_i < N; block_i += Br) {
+                // Load Qi
+                int local_i_end = std::min(Br, std::max(0, N - block_i));
+
+                for (int local_i = 0; local_i < local_i_end; local_i++) {
+                    int global_i = block_i + local_i;
+                    for (int k = 0; k < d; k++) {
+                        float q_val = fourDimRead(Q, b, h, global_i, k, H, N, d);
+                        twoDimWrite(Qi, local_i, k, d, q_val);
+                    }
+
+                    li[local_i] = l[block_i + local_i];
+
+                    for (int k = 0; k < d; k++) {
+                        twoDimWrite(Oi, local_i, k, d, zero);
+                    }
+                }
+
+                for (int block_j = 0; block_j < N; block_j += Bc) {
+                    // Load Kj, Vj
+                    int local_j_end = std::min(Bc, std::max(0, N - block_j));
+
+                    for (int local_j = 0; local_j < local_j_end; local_j++) {
+                        int global_j = block_j + local_j;
+                        for (int k = 0; k < d; k++) {
+                            float k_val = fourDimRead(K, b, h, global_j, k, H, N, d);
+                            float v_val = fourDimRead(V, b, h, global_j, k, H, N, d);
+
+                            twoDimWrite(Kj, local_j, k, d, k_val);
+                            twoDimWrite(Vj, local_j, k, d, v_val);
+                        }
+                    }
+
+                    // Compute Sij
+                    for (int local_i = 0; local_i < local_i_end; local_i++) {
+                        lij[local_i] = 0.0f;
+                        for (int local_j = 0; local_j < local_j_end; local_j++) {
+                            float acc = 0.0f;
+                            for (int k = 0; k < d; k++) {
+                                float query = twoDimRead(Qi, local_i, k, d);
+                                float key = twoDimRead(Kj, local_j, k, d);
+
+                                acc += query * key;
+                            }
+                            twoDimWrite(Sij, local_i, local_j, Bc, acc);
+                            lij[local_i] += exp(acc);
+                        }
+                        lnew[local_i] = li[local_i] + lij[local_i];
+                    }
+
+                    // Compute Pij = Softmax(Sij) and PV
+                    for (int local_i = 0; local_i < local_i_end; local_i++) {
+                        for (int k = 0; k < d; k++) {
+                            float acc = 0.0f;
+                            for (int local_j = 0; local_j < local_j_end; local_j++) {
+                                float s = twoDimRead(Sij, local_i, local_j, Bc);
+                                float p = exp(s) / lnew[local_i];
+                                float v = twoDimRead(Vj, local_j, k, d);
+                                acc += p * v;
+                            }
+
+                            float current_o = twoDimRead(Oi, local_i, k, d);
+                            float weighted_contribution = (li[local_i] / lnew[local_i]) * current_o + acc;
+                            twoDimWrite(Oi, local_i, k, d, weighted_contribution);
+                        }
+                        li[local_i] = lnew[local_i];
+                    }
+                }
+
+                // Write to O
+                for (int local_i = 0; local_i < local_i_end; local_i++) {
+                    int global_i = block_i + local_i;
+                    l[block_i + local_i] = li[local_i];
+                    for (int k = 0; k < d; k++) {
+                        float val = twoDimRead(Oi, local_i, k, d);
+                        fourDimWrite(O, b, h, global_i, k, H, N, d, val);
+                    }
+                }
+            }
+        }
+    }
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
