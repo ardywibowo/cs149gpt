@@ -276,14 +276,43 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     // -------- YOUR CODE HERE  -------- //
     // We give you a template of the first three loops for your convenience
     // loop over batch
+#pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
-        // loop over heads
         for (int h = 0; h < H; h++) {
             for (int i = 0; i < N; i++) {
-                // YRow is moved inside so each OpenMP thread gets a local copy.
-                at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(), torch::indexing::None)});
+                // Each thread gets its own ORow workspace
+                at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(),
+                                                                           torch::indexing::None)});
                 std::vector<float> ORow = formatTensor(ORowTensor);
-                // YOUR CODE HERE
+
+                // Step 1: Compute Q[i] * K^T (one row of attention matrix)
+                for (int j = 0; j < N; j++) {
+                    ORow[j] = 0.0f;  // Initialize
+                    for (int k = 0; k < d; k++) {
+                        float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                        float key = fourDimRead(K, b, h, j, k, H, N, d);
+                        ORow[j] += q * key;
+                    }
+                }
+
+                // Step 2: Softmax the row
+                float sum = 0.0f;
+                for (int j = 0; j < N; j++) {
+                    sum += exp(ORow[j]);
+                }
+                for (int j = 0; j < N; j++) {
+                    ORow[j] = exp(ORow[j]) / sum;
+                }
+
+                // Step 3: Multiply softmax row by V to get output row
+                for (int k = 0; k < d; k++) {
+                    float acc = 0.0f;
+                    for (int j = 0; j < N; j++) {
+                        float v = fourDimRead(V, b, h, j, k, H, N, d);
+                        acc += ORow[j] * v;
+                    }
+                    fourDimWrite(O, b, h, i, k, H, N, d, acc);
+                }
             }
         }
     }
